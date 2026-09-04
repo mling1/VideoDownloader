@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         VideoDownloader
 // @namespace    https://doubao.com
-// @version      1.0.5
-// @author       Doubao
+// @version      1.0.6
+// @author       mling1
 // @description  MSE流媒体视频捕获与无损合成下载工具
 // @include      *
 // @exclude      http://blog.luckly-mjw.cn/tool-show/media-source-extract/player/player.html
