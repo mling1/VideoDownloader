@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         VideoDownloader
 // @namespace    https://doubao.com
-// @version      1.0.8
+// @version      1.1.0
 // @author       mling1
 // @description  MSE流媒体视频捕获与无损合成下载工具
 // @include      *
@@ -29,14 +29,34 @@
   let countPending = false;
   let autoDownload = false;
   let autoDownloadDone = false; // 防止自动下载被重复触发
+  let captureLocked = false; // 自动完整下载合成期间锁定捕获，防止自动连播的init segment清空数据
   let mseHijacked = false;
   let sbHijacked = false; // SourceBuffer原型是否已劫持
   // 自动捕获时临时修改的视频状态（静音+隐藏画面），下载结束后恢复
   let hiddenVideoState = null;
   // SourceBuffer实例 -> {mime,buffers,kind} 的映射（原型劫持时靠它拿到mime）
-  const sbEntryMap = new WeakMap();
+  let sbEntryMap = new WeakMap();
   // 已见过的MediaSource实例，用于识别"新流开始"并清空上一个视频的缓存
   const seenMediaSources = new WeakSet();
+  // seek（跳至结尾/跳转进度条）时记录每个SourceBuffer已缓存的分片数量，
+  // 下载时只取seek前的分片，避免把seek位置前后的分片混在一起导致音画不同步
+  let seekedCutoff = null;
+  // 完整锁定：视频完整加载后不再追加新分片，防止自动连播/重播的内容混进来；
+  // 检测到切换视频或重播时清空旧数据并解除锁定
+  let completeLocked = false;
+  // 是否发生过大跳转（seek到后面）：跳转后endOfStream兜底逻辑不能误判为完整
+  let seekedToEnd = false;
+  // 是否因时间戳不连续被截断（seek跳转后加载的内容）：UI字体变红色提示
+  let truncatedByGap = false;
+  // 播放过程中持续记录的最大缓存end值（seek时buffered会被清理，用这个值判断跳转目标是否在已缓存范围内）
+  let maxBufferedEnd = 0;
+  // timeupdate事件持续记录的最新缓存范围（seek前最后一次记录的才准确，seek时buffered会被清理）
+  let lastBufferedRanges = [];
+  // 向前小幅跳转后暂时忽略ftyp清空（播放器重新初始化时会发ftyp，但同一条流不应清空旧数据）
+  let smallSeekIgnoreFtyp = false;
+  let smallSeekIgnoreUntil = 0;
+  // 标红后点击自动下载主动seek到开头的标志（区分主动seek和视频播放完自动重播）
+  let manualSeekToBeginning = false;
 
   // 通用：把任意类型的buffer（ArrayBuffer/TypedArray/DataView）复制为独立的ArrayBuffer
   // MSE的appendBuffer参数可以是这三种类型，必须统一处理，否则concat时会报错
@@ -84,13 +104,24 @@
     endConfirmShown = false;
     streamEnded = false;
     autoDownloadDone = false;
+    seekedCutoff = null;
+    completeLocked = false;
+    seekedToEnd = false;
+    truncatedByGap = false;
+    maxBufferedEnd = 0;
+    lastBufferedRanges = [];
+    smallSeekIgnoreFtyp = false;
+    smallSeekIgnoreUntil = 0;
+    manualSeekToBeginning = false;
+    // 重建WeakMap，防止切换视频复用SourceBuffer实例时返回旧entry（buffers里还有旧数据）
+    sbEntryMap = new WeakMap();
   }
 
   // 注册（或取回）一个SourceBuffer实例对应的捕获条目
   function registerSourceBuffer(sb, mime) {
     let entry = sbEntryMap.get(sb);
     if (!entry) {
-      entry = { mime: mime || '', buffers: [], kind: '' };
+      entry = { mime: mime || '', buffers: [], kind: '', lastDts: 0 };
       sbEntryMap.set(sb, entry);
       sourceBufferList.push(entry);
       renderPanel();
@@ -113,37 +144,79 @@
     const origAppend = proto.appendBuffer;
     proto.appendBuffer = wrapAsNative(function (buf) {
       try {
-        let entry = sbEntryMap.get(this);
-        if (!entry) entry = registerSourceBuffer(this, this.mimeType || '');
-        const copy = toArrayBufferCopy(buf);
-        // 检测init segment（ftyp box开头）：代表一条新流开始，
-        // 清空该轨旧缓存，确保buffers[0]是init。同时解决"切换视频/重建缓冲区后
-        // 旧分片与新分片混在一起、重复捕获"的问题。
-        if (copy.byteLength >= 8) {
-          const u8 = new Uint8Array(copy);
-          const fb = String.fromCharCode(u8[4], u8[5], u8[6], u8[7]);
-          if (fb === 'ftyp') {
-            entry.buffers = [];
-            entry.kind = '';
+        // 捕获锁定期间（自动完整下载合成中）不记录新数据，
+        // 防止自动连播的新视频数据追加到旧数据后面，导致下载的是混合内容
+        if (!captureLocked) {
+          let entry = sbEntryMap.get(this);
+          if (!entry) entry = registerSourceBuffer(this, this.mimeType || '');
+          const copy = toArrayBufferCopy(buf);
+          // 检测init segment（ftyp box开头）：代表一条新流开始，
+          // 清空该轨旧缓存，确保buffers[0]是init。同时解决"切换视频/重建缓冲区后
+          // 旧分片与新分片混在一起、重复捕获"的问题。
+          if (copy.byteLength >= 8) {
+            const u8 = new Uint8Array(copy);
+            const fb = String.fromCharCode(u8[4], u8[5], u8[6], u8[7]);
+            if (fb === 'ftyp') {
+              // 新流开始：解除完整锁定
+              completeLocked = false;
+              // 向前小幅跳转后5秒内，播放器重新初始化时会发ftyp，但同一条流不应清空旧数据
+              // 只有非小跳转场景才清空，防止切换视频/重建缓冲区时旧分片与新分片混在一起
+              const now = Date.now();
+              if (!smallSeekIgnoreFtyp || now > smallSeekIgnoreUntil) {
+                smallSeekIgnoreFtyp = false;
+                entry.buffers = [];
+                entry.kind = '';
+                entry.lastDts = 0;
+              }
+            } else if (fb === 'moof') {
+              // 完整锁定期间：不记录新的moof分片（视频已完整，防止自动连播/重播内容混进来）
+              if (completeLocked) {
+                return origAppend.call(this, buf);
+              }
+              // 记录最后一个moof分片的dts，用于调试和完整性检测
+              const newDts = getFirstSampleDts(copy);
+              if (newDts > 0) entry.lastDts = newDts;
+            }
           }
-        }
-        fragCount++;
-        entry.buffers.push(copy);
-        // mime缺失（addSourceBuffer没拦截到）时，用init segment内容兜底判断音视频
-        if (!entry.kind) {
-          const k = detectKindFromInit(copy);
-          if (k) entry.kind = k;
-        }
-        if (!countPending) {
-          countPending = true;
-          requestAnimationFrame(() => {
-            if (btnDownload) btnDownload.textContent = `下载已捕获片段 (${fragCount})`;
-            countPending = false;
-          });
+          fragCount++;
+          entry.buffers.push(copy);
+          // mime缺失（addSourceBuffer没拦截到）时，用init segment内容兜底判断音视频
+          if (!entry.kind) {
+            const k = detectKindFromInit(copy);
+            if (k) entry.kind = k;
+          }
+          if (!countPending) {
+            countPending = true;
+            requestAnimationFrame(() => {
+              if (btnDownload) {
+                // 三种颜色状态：截断（seek后不连续）红色、完整橙色、未完整默认白色
+                // 自动完整下载模式下不标黄（还在捕获中），保持白色
+                if (truncatedByGap && !autoDownload) {
+                  btnDownload.innerHTML = `下载已捕获片段 (<span style="color:#f44336;font-weight:600">${fragCount}</span>)`;
+                } else if (isBufferedComplete() && !autoDownload) {
+                  btnDownload.innerHTML = `下载已捕获片段 (<span style="color:#ff9800;font-weight:600">${fragCount}</span>)`;
+                  // 视频完整加载后锁定，不再追加新分片，防止自动连播/重播内容混进来。
+                  // 自动完整下载模式不在这里锁定（有专门的autoEndedHandler处理，避免16倍速播放时误判提前锁定）
+                  completeLocked = true;
+                  // 完整加载后重置大跳转标志，防止之前标红后又完整加载时文件名还带"片段"后缀
+                  truncatedByGap = false;
+                  seekedToEnd = false;
+                } else {
+                  btnDownload.textContent = `下载已捕获片段 (${fragCount})`;
+                }
+              }
+              countPending = false;
+            });
+          }
         }
       } catch (e) { /* 捕获逻辑绝不能影响网站正常播放 */ }
       return origAppend.call(this, buf);
     });
+
+    // 注意：不在abort()/remove()时清空我们记录的moof分片。
+    // 原因：B站等播放器在正常播放过程中会频繁调用abort()调整缓冲，
+    // 如果每次abort都清空moof分片，会导致捕获的数据被反复清空，最后只剩一小段。
+    // seek/切换视频的检测改由appendBuffer时的时间戳不连续检测和ftyp检测来完成。
 
     // 切换编码（changeType）时同步更新mime
     if (proto.changeType) {
@@ -154,6 +227,7 @@
         return origChange.call(this, mime);
       });
     }
+
   }
 
   // ========== 核心劫持②：MediaSource.addSourceBuffer/endOfStream（拿准确mime、识别新流） ==========
@@ -167,19 +241,22 @@
     MS.prototype.endOfStream = wrapAsNative(function () {
       streamEnded = true;
       if (!endConfirmShown) {
-        endConfirmShown = true;
-        // 自动下载模式：静默下载，不弹confirm；用autoDownloadDone防止重复触发
-        if (autoDownload && !autoDownloadDone) {
-          autoDownloadDone = true;
-          autoDownload = false;
-          download(true, true);
-        } else if (!autoDownload) {
-          // 非自动下载模式：正常弹confirm
-          const complete = isBufferedComplete();
-          const msg = complete
-            ? '✅ 视频已完整加载，资源全部捕获成功，是否下载？'
-            : '⚠️ 视频未完整加载，下载可能损坏。是否继续？';
-          if (confirm(msg)) download(true, false);
+        // 检查视频是否真正播放到结尾（防止播放过程中切换清晰度/seek等触发endOfStream误弹窗）
+        const v = document.querySelector('video');
+        const isAtEnd = v && v.duration && v.currentTime > 0 && (v.duration - v.currentTime) < 3;
+        const complete = isBufferedComplete();
+        if (isAtEnd) {
+          endConfirmShown = true;
+          // 自动下载模式：静默下载，不弹confirm；用autoDownloadDone防止重复触发
+          if (autoDownload && !autoDownloadDone) {
+            autoDownloadDone = true;
+            autoDownload = false;
+            download(true, true);
+          } else if (!autoDownload && expanded && complete) {
+            // 非自动下载模式：只有面板展开且视频完整加载时才弹下载确认
+            const msg = '✅ 视频已完整加载，资源全部捕获成功，是否下载？';
+            if (confirm(msg)) download(true, false);
+          }
         }
       }
       origEnd.call(this);
@@ -279,7 +356,7 @@
   let pressTimer = null;
   const pressDelay = 500;
 
-  const ONLINE_TOOL = 'http://blog.luckly-mjw.cn/tool-show/media-source-extract/player/player.html';
+  const ONLINE_TOOL = 'http://blog.luckly-mjw.cn/tool-show/m3u8-downloader/index.html';
 
   // ========== mp4box库按需加载 ==========
   let mp4boxLoaded = false;
@@ -306,10 +383,116 @@
     catch { return document.title; }
   }
 
-  function isBufferedComplete() {
+  // 从fMP4 moof分片中提取第一个sample的dts（解码时间戳），
+  // 用于判断是否从头开始捕获（seek到结尾时第一个moof的dts会很大）
+  function getFirstSampleDts(buf) {
+    if (!buf || buf.byteLength < 16) return 0;
+    try {
+      const dv = new DataView(buf);
+      let offset = 0;
+      const moofSize = dv.getUint32(offset);
+      const moofType = String.fromCharCode(dv.getUint8(offset+4), dv.getUint8(offset+5), dv.getUint8(offset+6), dv.getUint8(offset+7));
+      if (moofType !== 'moof') return 0;
+      offset += 8;
+      while (offset + 8 <= buf.byteLength) {
+        const boxSize = dv.getUint32(offset);
+        if (boxSize < 8 || offset + boxSize > buf.byteLength) break;
+        const boxType = String.fromCharCode(dv.getUint8(offset+4), dv.getUint8(offset+5), dv.getUint8(offset+6), dv.getUint8(offset+7));
+        if (boxType === 'traf') {
+          let trafOffset = offset + 8;
+          while (trafOffset + 8 <= offset + boxSize) {
+            const subSize = dv.getUint32(trafOffset);
+            if (subSize < 8) break;
+            const subType = String.fromCharCode(dv.getUint8(trafOffset+4), dv.getUint8(trafOffset+5), dv.getUint8(trafOffset+6), dv.getUint8(trafOffset+7));
+            if (subType === 'tfdt') {
+              const version = dv.getUint8(trafOffset + 8);
+              if (version === 1) {
+                const high = dv.getUint32(trafOffset + 12);
+                const low = dv.getUint32(trafOffset + 16);
+                return high * 4294967296 + low;
+              } else {
+                return dv.getUint32(trafOffset + 12);
+              }
+            }
+            trafOffset += subSize;
+          }
+        }
+        offset += boxSize;
+      }
+    } catch (e) {}
+    return 0;
+  }
+
+  // 检测分片时间戳不连续点（seek跳转后加载的内容dts会突然跳变），
+  // 只保留前面连续的部分，去掉seek后加载的不连续内容，避免合成时音画不同步。
+  // 用相邻分片的相对差值判断，不依赖固定timescale（视频通常90000、音频48000）。
+  function truncateAtTimeGap(entry) {
+    if (!entry || !entry.buffers || entry.buffers.length < 3) return entry.buffers;
+    const result = [];
+    let prevDts = -1;
+    let normalDelta = 0; // 正常相邻分片的时间戳差值（取前几个分片的平均）
+    let deltaCount = 0;
+    for (let i = 0; i < entry.buffers.length; i++) {
+      const buf = entry.buffers[i];
+      if (buf.byteLength < 8) { result.push(buf); continue; }
+      const u8 = new Uint8Array(buf);
+      const fb = String.fromCharCode(u8[4], u8[5], u8[6], u8[7]);
+      if (fb === 'ftyp') { result.push(buf); continue; } // init segment保留
+      if (fb !== 'moof') { result.push(buf); continue; }
+      const dts = getFirstSampleDts(buf);
+      if (dts > 0 && prevDts >= 0) {
+        const delta = dts - prevDts;
+        if (normalDelta > 0 && deltaCount >= 2) {
+          // 时间戳倒退，或差值远大于正常差值（>5倍），说明是seek后加载的不连续内容，截断
+          if (delta < 0 || delta > normalDelta * 5) {
+            break;
+          }
+        }
+        if (delta > 0) {
+          // 累计正常差值（前几个分片）
+          if (deltaCount < 5) {
+            normalDelta = (normalDelta * deltaCount + delta) / (deltaCount + 1);
+            deltaCount++;
+          }
+        }
+      }
+      if (dts > 0) prevDts = dts;
+      result.push(buf);
+    }
+    return result;
+  }
+
+  // 判断某个时间点是否在MSE已缓存范围内（缓存内跳转不会加载新分片，不会导致异常追加）
+  function isTimeBuffered(time) {
     const v = document.querySelector('video');
-    if (!v?.duration || v.buffered.length === 0) return false;
-    return v.buffered.start(0) < 1 && (v.duration - v.buffered.end(v.buffered.length - 1)) < 1;
+    if (!v || !v.buffered || v.buffered.length === 0) return false;
+    for (let i = 0; i < v.buffered.length; i++) {
+      if (time >= v.buffered.start(i) - 1 && time <= v.buffered.end(i) + 1) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  function isBufferedComplete() {
+    // 优先检查MSE buffered：跳至结尾时buffered从中间开始（start>3），不是完整视频
+    const v = document.querySelector('video');
+    if (v?.duration && v.buffered.length > 0) {
+      const start = v.buffered.start(0);
+      const end = v.buffered.end(v.buffered.length - 1);
+      // 从中间开始（跳至结尾/seek）不是完整视频
+      if (start > 3) return false;
+      // 从接近0开始且覆盖到接近结尾 → 完整
+      if (start < 3 && (v.duration - end) < 3) return true;
+    }
+    // MSE buffered不可用时（播放完成后被清理/自动连播替换），检查捕获状态：
+    // endOfStream已调用 且 视频和音频都有init+moof分片 且 没有发生过大跳转 → 认为完整
+    if (streamEnded && sourceBufferList.length >= 2 && !seekedToEnd) {
+      const hasVideo = sourceBufferList.some(e => itemKind(e) === 'video' && e.buffers.length > 1);
+      const hasAudio = sourceBufferList.some(e => itemKind(e) === 'audio' && e.buffers.length > 1);
+      if (hasVideo && hasAudio) return true;
+    }
+    return false;
   }
 
   function concatBufs(bufs) {
@@ -344,64 +527,9 @@
   }
 
   function openOnlineTool() {
-    // 有m3u8地址时带参数打开，没有时直接打开工具主页
-    const url = m3u8Url ? `${ONLINE_TOOL}?url=${encodeURIComponent(m3u8Url)}` : ONLINE_TOOL;
+    // 有m3u8地址时通过source参数传入，没有时直接打开工具主页
+    const url = m3u8Url ? `${ONLINE_TOOL}?source=${encodeURIComponent(m3u8Url)}` : ONLINE_TOOL;
     window.open(url, '_blank');
-  }
-
-  // 合成失败自定义弹窗：提供分开下载、在线完整下载、取消三个选项
-  function showMergeFailDialog(complete, errorMsg, onSeparate) {
-    // 移除已有弹窗
-    const old = document.getElementById('vd-merge-fail-dialog');
-    if (old) old.remove();
-
-    const overlay = document.createElement('div');
-    overlay.id = 'vd-merge-fail-dialog';
-    overlay.style.cssText = 'position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,0.5);z-index:2147483647;display:flex;align-items:center;justify-content:center;font-family:system-ui,-apple-system,sans-serif;';
-
-    const dialog = document.createElement('div');
-    dialog.style.cssText = 'background:#fff;border-radius:12px;padding:24px;max-width:420px;width:90%;box-shadow:0 8px 32px rgba(0,0,0,0.2);';
-
-    const title = document.createElement('div');
-    title.style.cssText = 'font-size:16px;font-weight:600;margin-bottom:12px;color:#1a1a1a;';
-    title.textContent = '视频合成失败';
-
-    const status = document.createElement('div');
-    status.style.cssText = `font-size:13px;margin-bottom:8px;padding:8px 12px;border-radius:6px;${complete ? 'background:#e6f7ea;color:#1a7f37;' : 'background:#fff4e5;color:#9a6700;'}`;
-    status.textContent = complete ? '✅ 视频已完整加载' : '⚠️ 视频未完整加载';
-
-    const error = document.createElement('div');
-    error.style.cssText = 'font-size:13px;color:#666;margin-bottom:16px;line-height:1.5;word-break:break-all;';
-    error.textContent = '错误信息：' + (errorMsg || '未知错误');
-
-    const btnRow = document.createElement('div');
-    btnRow.style.cssText = 'display:flex;gap:8px;flex-wrap:wrap;';
-
-    const btnSeparate = document.createElement('button');
-    btnSeparate.style.cssText = 'flex:1;min-width:100px;padding:8px 12px;border:1px solid #d0d7de;border-radius:6px;background:#f6f8fa;color:#1a1a1a;font-size:13px;cursor:pointer;';
-    btnSeparate.textContent = '分开下载';
-    btnSeparate.onclick = () => { overlay.remove(); onSeparate(); };
-
-    const btnOnline = document.createElement('button');
-    btnOnline.style.cssText = 'flex:1;min-width:100px;padding:8px 12px;border:1px solid #0969da;border-radius:6px;background:#0969da;color:#fff;font-size:13px;cursor:pointer;';
-    btnOnline.textContent = '在线完整下载';
-    btnOnline.onclick = () => { overlay.remove(); openOnlineTool(); };
-
-    const btnCancel = document.createElement('button');
-    btnCancel.style.cssText = 'flex:1;min-width:80px;padding:8px 12px;border:1px solid #d0d7de;border-radius:6px;background:#fff;color:#666;font-size:13px;cursor:pointer;';
-    btnCancel.textContent = '取消';
-    btnCancel.onclick = () => { overlay.remove(); };
-
-    btnRow.appendChild(btnSeparate);
-    btnRow.appendChild(btnOnline);
-    btnRow.appendChild(btnCancel);
-
-    dialog.appendChild(title);
-    dialog.appendChild(status);
-    dialog.appendChild(error);
-    dialog.appendChild(btnRow);
-    overlay.appendChild(dialog);
-    document.body.appendChild(overlay);
   }
 
   // ========== 核心修复：mp4box无损合成（修复时序：数据喂完后才start） ==========
@@ -683,16 +811,53 @@
 
   // ========== 跳至结尾 ==========
   function skipToEnd() {
+    // 跳至结尾前先标红锁定（变色=锁定），防止跳转后的片尾内容混入已捕获分片
+    if (sourceBufferList.length > 0 && !completeLocked) {
+      seekedToEnd = true;
+      truncatedByGap = true;
+      completeLocked = true;
+      if (btnDownload) {
+        btnDownload.innerHTML = `下载已捕获片段 (<span style="color:#f44336;font-weight:600">${fragCount}</span>)`;
+      }
+    }
     document.querySelectorAll('video').forEach(v => {
       if (v.duration) v.currentTime = v.duration - 0.1;
     });
   }
 
-  // ========== 自动完整下载（静默启动） ==========
+  // ========== 自动完整下载（静默启动，再点一次可暂停取消） ==========
+  let autoEndedHandler = null; // 保存ended事件处理函数，方便取消时移除
+  let originalSpeed = 1; // 记录自动下载前的播放倍数，完成/取消时恢复
   function autoCompleteDownload() {
     const video = document.querySelector('video');
     if (!video) return alert('未找到视频元素');
-    if (merging || autoDownload) return;
+    if (merging) return;
+
+    // 如果已经在自动下载中，再次点击则暂停取消
+    if (autoDownload) {
+      autoDownload = false;
+      autoDownloadDone = false;
+      is16x = false;
+      applySpeed(originalSpeed);
+      btnSpeed.textContent = `${originalSpeed}×`;
+      btnAuto.textContent = '自动完整下载';
+      if (autoEndedHandler) {
+        video.removeEventListener('ended', autoEndedHandler);
+        autoEndedHandler = null;
+      }
+      video.pause();
+      // 恢复视频的静音和隐藏状态
+      if (hiddenVideoState) {
+        const hv = hiddenVideoState;
+        hiddenVideoState = null;
+        try {
+          hv.el.muted = hv.muted;
+          hv.el.style.visibility = hv.visibility;
+          hv.el.style.opacity = hv.opacity;
+        } catch (e) {}
+      }
+      return;
+    }
 
     if (isBufferedComplete()) {
       download(true, true);
@@ -700,15 +865,61 @@
     }
 
     // 关键：先设置autoDownload=true和autoDownloadDone=false，再操作video
-    // video.currentTime=0可能导致旧流关闭触发endOfStream，再导致新流结束触发第二次endOfStream
-    // 用autoDownloadDone确保只有第一次endOfStream会触发下载，第二次不会弹confirm
+    // 视频播放完会自动从头开始，不需要主动设置currentTime=0；
+    // 在seeked事件里检测到从头开始时再解除锁定并清空分片
+    originalSpeed = video.playbackRate || 1; // 记录原来的倍数，完成/取消时恢复
     autoDownload = true;
     autoDownloadDone = false;
     is16x = true;
     applySpeed(16);
     btnSpeed.textContent = '16×';
-    btnAuto.textContent = '自动捕获中...';
+    btnAuto.textContent = '自动捕获中(点击暂停)';
     // 不重置endConfirmShown，避免旧流关闭触发的endOfStream被当成新的一次
+
+    // 如果已经标红（发生过大跳转，视频已不完整），主动从头开始播放，
+    // 先暂停→清空moof保留ftyp→解除锁定→seek到开头→等seek完成→play，
+    // 必须先解除锁定再seek，否则设置currentTime=0后播放器加载的分片会因为completeLocked=true被跳过
+    let needDelayPlay = false;
+    if (truncatedByGap || completeLocked) {
+      needDelayPlay = true;
+      video.pause();
+      // 先清空moof保留ftyp初始化片段
+      sourceBufferList.forEach(entry => {
+        const initBuffers = [];
+        for (const buf of entry.buffers) {
+          if (buf.byteLength >= 8) {
+            const u8 = new Uint8Array(buf);
+            const fb = String.fromCharCode(u8[4], u8[5], u8[6], u8[7]);
+            if (fb === 'ftyp') initBuffers.push(buf);
+          }
+        }
+        entry.buffers = initBuffers;
+        entry.lastDts = 0;
+      });
+      fragCount = sourceBufferList.reduce((sum, e) => sum + e.buffers.length, 0);
+      if (btnDownload) {
+        btnDownload.textContent = `下载已捕获片段 (${fragCount})`;
+      }
+      // 先解除锁定（重置所有相关变量），再seek到开头
+      completeLocked = false;
+      truncatedByGap = false;
+      seekedToEnd = false;
+      maxBufferedEnd = 0;
+      manualSeekToBeginning = false;
+      streamEnded = false;
+      endConfirmShown = false;
+      lastBufferedRanges = [];
+      smallSeekIgnoreFtyp = false;
+      smallSeekIgnoreUntil = 0;
+      // 用标志区分主动seek和自动重播，防止seeked事件里误调用resetCaptureState()把ftyp清掉
+      manualSeekToBeginning = true;
+      video.currentTime = 0;
+      // 等seek完成后再play（跳至结尾后sourceBuffer里还有片尾内容，需要更长时间让播放器完全从0重新加载）
+      setTimeout(() => {
+        manualSeekToBeginning = false;
+        video.play();
+      }, 800);
+    }
 
     // 快速捕获期间静音并隐藏画面（不用display:none，那会暂停播放导致不再加载分片；
     // visibility:hidden只停止画面绘制、不影响MSE持续拉流），下载结束后在download()里恢复
@@ -723,18 +934,40 @@
     video.style.opacity = '0';
 
     // 监听视频播放结束（有些网站不会调用endOfStream，用ended事件兜底）
-    const onEnded = () => {
-      video.removeEventListener('ended', onEnded);
+    autoEndedHandler = () => {
+      video.removeEventListener('ended', autoEndedHandler);
+      autoEndedHandler = null;
       if (autoDownload && !autoDownloadDone) {
         autoDownloadDone = true;
         autoDownload = false;
-        download(true, true);
+        // 立即暂停，防止网站自动连播下一个视频
+        video.pause();
+        // 4倍速播放时视频分片能跟上播放速度，播放完成后等2秒让最后几个分片加载完成，
+        // 然后锁定捕获并合成下载。不检查MSE buffered，因为MSE会清理已播放部分的缓冲。
+        setTimeout(() => {
+          captureLocked = true;
+          // 自动完整下载播放完成，认为是完整视频，设置完整锁定并更新UI（片段数变橙色）
+          completeLocked = true;
+          // 重置大跳转标志，防止之前标红后下载完再下载时文件名还带"片段"后缀
+          truncatedByGap = false;
+          seekedToEnd = false;
+          // 恢复原来的播放倍数
+          is16x = false;
+          applySpeed(originalSpeed);
+          btnSpeed.textContent = `${originalSpeed}×`;
+          if (btnDownload) {
+            btnDownload.innerHTML = `下载已捕获片段 (<span style="color:#ff9800;font-weight:600">${fragCount}</span>)`;
+          }
+          download(true, true);
+        }, 2000);
       }
     };
-    video.addEventListener('ended', onEnded);
+    video.addEventListener('ended', autoEndedHandler);
 
-    video.currentTime = 0;
-    video.play();
+    // 标红处理时已经在setTimeout里play了，这里不重复play
+    if (!needDelayPlay) {
+      video.play();
+    }
   }
 
   // ========== 扫描视频资源 ==========
@@ -744,6 +977,123 @@
       const src = v.currentSrc || v.src;
       if (!src) return;
       if (src.includes('.m3u8')) m3u8Url = src;
+
+      // 持续记录最大缓存end值（seek时buffered会被清理，用这个值判断跳转目标是否在已缓存范围内）
+      // 用progress事件驱动更新（缓冲变化时立即更新），比轮询更及时
+      if (!v.dataset.vdBufBound) {
+        v.dataset.vdBufBound = '1';
+        v.addEventListener('progress', () => {
+          if (completeLocked) return;
+          if (v.buffered && v.buffered.length > 0) {
+            for (let i = 0; i < v.buffered.length; i++) {
+              if (v.buffered.end(i) > maxBufferedEnd) maxBufferedEnd = v.buffered.end(i);
+            }
+          }
+        });
+        // timeupdate事件持续记录最新缓存范围（seek前最后一次记录的才准确，seek时buffered会被清理）
+        v.addEventListener('timeupdate', () => {
+          if (completeLocked) return;
+          lastBufferedRanges = [];
+          if (v.buffered && v.buffered.length > 0) {
+            for (let i = 0; i < v.buffered.length; i++) {
+              lastBufferedRanges.push({ start: v.buffered.start(i), end: v.buffered.end(i) });
+            }
+          }
+        });
+      }
+      if (!completeLocked && v.buffered && v.buffered.length > 0) {
+        for (let i = 0; i < v.buffered.length; i++) {
+          if (v.buffered.end(i) > maxBufferedEnd) maxBufferedEnd = v.buffered.end(i);
+        }
+      }
+
+      // 监听video元素的src变化：抖音等平台切换视频时复用同一个video元素，
+      // 只改变src，不发ftyp也不创建新MediaSource，此时需要重置捕获状态，
+      // 防止旧视频数据和新视频数据混合。用dataset标志避免重复监听。
+      if (!v.dataset.vdSrcBound) {
+        v.dataset.vdSrcBound = '1';
+        v.dataset.vdLastSrc = src;
+        const observer = new MutationObserver(() => {
+          const newSrc = v.currentSrc || v.src;
+          if (newSrc && newSrc !== v.dataset.vdLastSrc && !captureLocked) {
+            v.dataset.vdLastSrc = newSrc;
+            resetCaptureState();
+          }
+        });
+        observer.observe(v, { attributes: true, attributeFilter: ['src', 'currentSrc'] });
+      } else if (v.dataset.vdLastSrc !== src && !captureLocked) {
+        // 兜底：scanVideos轮询时也检查一次src变化
+        v.dataset.vdLastSrc = src;
+        resetCaptureState();
+      }
+
+      // 监听seeked事件：重播检测（seek到开头且已完整则清空旧数据）、大跳转标记
+      if (!v.dataset.vdSeekBound) {
+        v.dataset.vdSeekBound = '1';
+        v.addEventListener('seeked', () => {
+          if (captureLocked) return;
+          // 自动完整下载模式下：不处理大跳转（16倍速内部seek会误触发），
+          // 但检测到从头开始（currentTime<3）且已锁定时，解除锁定并清空分片，从头开始捕获
+          if (autoDownload) {
+            // 标红后点击自动下载主动seek到开头：不reset（有专门的setTimeout处理清空moof保留ftyp）
+            if (!manualSeekToBeginning && v.currentTime < 3 && completeLocked) {
+              resetCaptureState();
+              if (btnDownload) {
+                btnDownload.textContent = `下载已捕获片段 (0)`;
+              }
+            }
+            v.dataset.vdLastCt = v.currentTime;
+            return;
+          }
+          // 只在跳转幅度较大时处理（>3秒），防止播放器内部微小调整误触发
+          if (!v.dataset.vdLastCt || Math.abs(v.currentTime - parseFloat(v.dataset.vdLastCt)) > 3) {
+            // 重播检测：seek到开头（currentTime<3）且之前已经锁定，说明是重播，
+            // 清空旧数据并解除锁定，开始捕获新的一遍
+            if (v.currentTime < 3 && completeLocked) {
+              resetCaptureState();
+            } else if (!completeLocked) {
+              const lastCt = parseFloat(v.dataset.vdLastCt) || 0;
+              const isForward = v.currentTime > lastCt; // 向后跳转
+              // 向前跳转：大幅跳转（>15秒）才标红，小幅跳转不会异常
+              // 向后跳转：超出最大缓存end才标红，缓存内不会异常
+              let needLock = false;
+              if (!isForward) {
+                const jumpSize = lastCt - v.currentTime;
+                if (jumpSize > 15) {
+                  needLock = true;
+                } else {
+                  // 向前小幅跳转：设置5秒内忽略ftyp清空（播放器重新初始化时会发ftyp，但同一条流不应清空旧数据）
+                  smallSeekIgnoreFtyp = true;
+                  smallSeekIgnoreUntil = Date.now() + 5000;
+                }
+              } else {
+                if (v.currentTime > maxBufferedEnd) needLock = true;
+              }
+              if (needLock) {
+                seekedToEnd = true;
+                truncatedByGap = true;
+                completeLocked = true;
+                if (btnDownload) {
+                  btnDownload.innerHTML = `下载已捕获片段 (<span style="color:#f44336;font-weight:600">${fragCount}</span>)`;
+                }
+              }
+            }
+          }
+          v.dataset.vdLastCt = v.currentTime;
+        });
+        // 普通模式下视频播放完成（ended）后锁定捕获，防止自动重播的内容被追加
+        v.addEventListener('ended', () => {
+          if (captureLocked || autoDownload) return; // 自动完整下载模式有专门的autoEndedHandler处理
+          if (sourceBufferList.length > 0 && !completeLocked) {
+            completeLocked = true;
+            // 大跳转后是红色，正常完整是橙色
+            const color = seekedToEnd ? '#f44336' : '#ff9800';
+            if (btnDownload) {
+              btnDownload.innerHTML = `下载已捕获片段 (<span style="color:${color};font-weight:600">${fragCount}</span>)`;
+            }
+          }
+        });
+      }
     });
 
     if (sourceBufferList.length > 0) {
@@ -763,14 +1113,13 @@
     if (fragCount === 0) return alert('暂未捕获到视频片段');
     if (merging) return;
 
-    if (!skipCheck && !autoMode) {
-      const complete = isBufferedComplete();
-      const msg = complete
-        ? '✅ 视频已完整加载，是否开始下载？'
-        : '⚠️ 视频未完整加载\n下载可能出现无画面、卡顿、无法拖动进度条等问题。\n\n是否继续下载？';
-      if (!confirm(msg)) return;
+    // 大跳转后下载：询问是否继续（可能音画不同步等问题）
+    if ((seekedToEnd || truncatedByGap) && !autoMode) {
+      if (!confirm('检测到大跳转，下载的视频可能出现音画不同步、后半段无声、进度条无法拖拽或画面异常等问题，建议使用自动完整下载获取完整视频\n是否继续下载？')) return;
     }
 
+    // 直接开始合成，不弹"未完整加载是否继续"的提醒；
+    // 合成成功直接下载，合成失败才弹弹窗询问是否分开下载
     merging = true;
     const oldText = btnDownload.textContent;
     btnDownload.textContent = '合成中...';
@@ -778,10 +1127,35 @@
     try {
       const title = getTitle();
       // 不完整下载时文件名加"片段"后缀
-      const nameSuffix = isBufferedComplete() ? '' : '_片段';
+      // 自动完整下载模式下认为是完整视频（从头播到尾），不加片段后缀；
+      // completeLocked=true（标黄/完整锁定）也认为是完整视频，不加片段后缀
+      const nameSuffix = autoMode ? '' : ((completeLocked || isBufferedComplete()) ? '' : '_片段');
+      // 检测分片时间戳不连续点（seek跳转后加载的内容dts会突然跳变），
+      // 只保留前面连续的部分，去掉seek后加载的不连续内容，避免合成时音画不同步。
+      // 如果发生了截断，标记truncatedByGap，UI字体变红色提示。
+      let didTruncate = false;
+      sourceBufferList.forEach(entry => {
+        const before = entry.buffers.length;
+        entry.buffers = truncateAtTimeGap(entry);
+        if (entry.buffers.length < before) didTruncate = true;
+      });
+      if (didTruncate) {
+        // 截断了不连续内容，标记红色（保持锁定状态，不解除）
+        truncatedByGap = true;
+      }
+      fragCount = sourceBufferList.reduce((s, e) => s + e.buffers.length, 0);
       // 分类音视频：优先mime，mime缺失时用init内容判断的kind兜底
       let videoItems = sourceBufferList.filter(i => itemKind(i) === 'video');
       let audioItems = sourceBufferList.filter(i => itemKind(i) === 'audio');
+      // 多个MediaSource时（抖音等平台会预加载下一个视频，同时存在当前视频和下一个视频的MediaSource），
+      // 只取最后一组（最新创建的）音视频轨，避免下载到预加载的下一个视频。
+      // sourceBufferList按创建顺序排列，每个MediaSource的video+audio连续排列。
+      if (videoItems.length > 1 && audioItems.length > 1) {
+        const lastVideo = videoItems[videoItems.length - 1];
+        const lastAudio = audioItems[audioItems.length - 1];
+        videoItems = [lastVideo];
+        audioItems = [lastAudio];
+      }
       // 最终兜底：视频或音频缺失时，用未分类条目按数据总量补全（视频通常远大于音频）。
       // 不要求unknown>=2：常见场景是一个轨识别出来了、另一个轨kind缺失（不完整捕获时
       // mime没记录+init segment错过），此时只有1个unknown，也必须补全否则会走单轨道分开下载。
@@ -833,31 +1207,51 @@
         a.remove();
         setTimeout(() => URL.revokeObjectURL(a.href), 1000);
       } catch (e) {
-        // 合成失败：自定义弹窗，提供分开下载/在线完整下载/取消三个选项
+        // 合成失败
         const complete = isBufferedComplete();
-        showMergeFailDialog(complete, e.message, () => {
-          [videoItems[0], audioItems[0]].forEach((item, idx) => {
-            setTimeout(() => {
-              const kind = itemKind(item);
-              const mime = (item.mime || '').split(';')[0] || (kind === 'audio' ? 'audio/mp4' : 'video/mp4');
-              const ext = mime.split('/')[1] || 'mp4';
-              const type = kind === 'audio' ? '音频' : '视频';
-              const blob = new Blob(item.buffers, { type: mime });
-              const a = document.createElement('a');
-              a.download = `${title}${nameSuffix}_${type}.${ext}`;
-              a.href = URL.createObjectURL(blob);
-              a.style.display = 'none';
-              document.body.appendChild(a);
-              a.click();
-              a.remove();
-              setTimeout(() => URL.revokeObjectURL(a.href), 1000);
-            }, idx * 300);
-          });
+        const hasVideo = videoItems.length > 0 && videoItems[0].buffers.length > 0;
+        const hasAudio = audioItems.length > 0 && audioItems[0].buffers.length > 0;
+        // 没有可下载的内容时，直接提示错误，不弹分开下载的confirm
+        if (!hasVideo && !hasAudio) {
+          alert(`${complete ? '✅ 视频已完整加载' : '⚠️ 视频未完整加载'}\n视频合成失败：${e.message || '未知错误'}\n暂无可下载的内容，请刷新页面后从头播放再下载`);
+          return;
+        }
+        // 有可下载内容时，弹原生confirm询问是否分开下载
+        const failMsg = `${complete ? '✅ 视频已完整加载' : '⚠️ 视频未完整加载'}
+视频合成失败：${e.message || '未知错误'}
+是否分开下载视频和音频文件？（也可点击面板「在线完整下载」跳转在线工具处理）`;
+        if (!confirm(failMsg)) return;
+
+        [videoItems[0], audioItems[0]].forEach((item, idx) => {
+          setTimeout(() => {
+            const kind = itemKind(item);
+            const mime = (item.mime || '').split(';')[0] || (kind === 'audio' ? 'audio/mp4' : 'video/mp4');
+            const ext = mime.split('/')[1] || 'mp4';
+            const type = kind === 'audio' ? '音频' : '视频';
+            const blob = new Blob(item.buffers, { type: mime });
+            const a = document.createElement('a');
+            a.download = `${title}${nameSuffix}_${type}.${ext}`;
+            a.href = URL.createObjectURL(blob);
+            a.style.display = 'none';
+            document.body.appendChild(a);
+            a.click();
+            a.remove();
+            setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+          }, idx * 300);
         });
       }
     } finally {
       merging = false;
-      btnDownload.textContent = oldText;
+      // 三种颜色状态：截断红色、完整锁定橙色（等重播或切换视频时才解除），否则恢复下载前文字
+      if (btnDownload) {
+        if (truncatedByGap) {
+          btnDownload.innerHTML = `下载已捕获片段 (<span style="color:#f44336;font-weight:600">${fragCount}</span>)`;
+        } else if (completeLocked) {
+          btnDownload.innerHTML = `下载已捕获片段 (<span style="color:#ff9800;font-weight:600">${fragCount}</span>)`;
+        } else {
+          btnDownload.textContent = oldText;
+        }
+      }
       if (btnAuto) btnAuto.textContent = '自动完整下载';
       // 恢复自动捕获期间临时静音/隐藏的视频画面
       if (hiddenVideoState) {
@@ -869,6 +1263,8 @@
           hv.el.style.opacity = hv.opacity;
         } catch (e) { /* 视频元素可能已被页面移除，忽略 */ }
       }
+      // 释放捕获锁（自动完整下载合成完成后，允许init segment清空旧数据）
+      captureLocked = false;
     }
   }
 
@@ -953,7 +1349,7 @@
         body.style.transform = 'translateX(0)';
         body.style.pointerEvents = 'auto';
         scanVideos();
-        scanTimer = setInterval(scanVideos, 1500);
+        scanTimer = setInterval(scanVideos, 2000);
       } else {
         body.style.visibility = 'hidden';
         body.style.opacity = '0';
@@ -971,6 +1367,14 @@
     body.appendChild(btnOnline);
     body.appendChild(btnAuto);
     document.documentElement.insertBefore(panel, document.head);
+
+    // UI初始化完成后立即重置一次捕获状态：
+    // 脚本在document-start就开始劫持MSE，此时抖音等平台可能已预加载了下一个视频的分片，
+    // 导致一开始捕获的数据是错的（下载到第二个视频）。这里清掉预加载的错误数据，
+    // 从当前正在播放的视频开始捕获。
+    resetCaptureState();
+    // 页面加载就扫描视频并添加事件监听（不依赖面板展开），确保跳转标红等功能始终生效
+    scanVideos();
   }
 
   // DOM就绪后渲染UI
@@ -984,6 +1388,8 @@
   window.__vd = {
     getBuffers: () => sourceBufferList,
     getFrag: () => fragCount,
-    mergeMP4: mergeMP4
+    mergeMP4: mergeMP4,
+    isBufferedComplete: isBufferedComplete,
+    getState: () => ({ streamEnded, captureLocked, autoDownload })
   };
 })();
