@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         VideoDownloader
 // @namespace    https://doubao.com
-// @version      1.0.6
+// @version      1.0.7
 // @author       mling1
 // @description  MSE流媒体视频捕获与无损合成下载工具
 // @include      *
@@ -321,8 +321,64 @@
   }
 
   function openOnlineTool() {
-    if (!m3u8Url) return alert('未检测到m3u8地址');
-    window.open(`${ONLINE_TOOL}?url=${encodeURIComponent(m3u8Url)}`, '_blank');
+    // 有m3u8地址时带参数打开，没有时直接打开工具主页
+    const url = m3u8Url ? `${ONLINE_TOOL}?url=${encodeURIComponent(m3u8Url)}` : ONLINE_TOOL;
+    window.open(url, '_blank');
+  }
+
+  // 合成失败自定义弹窗：提供分开下载、在线完整下载、取消三个选项
+  function showMergeFailDialog(complete, errorMsg, onSeparate) {
+    // 移除已有弹窗
+    const old = document.getElementById('vd-merge-fail-dialog');
+    if (old) old.remove();
+
+    const overlay = document.createElement('div');
+    overlay.id = 'vd-merge-fail-dialog';
+    overlay.style.cssText = 'position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,0.5);z-index:2147483647;display:flex;align-items:center;justify-content:center;font-family:system-ui,-apple-system,sans-serif;';
+
+    const dialog = document.createElement('div');
+    dialog.style.cssText = 'background:#fff;border-radius:12px;padding:24px;max-width:420px;width:90%;box-shadow:0 8px 32px rgba(0,0,0,0.2);';
+
+    const title = document.createElement('div');
+    title.style.cssText = 'font-size:16px;font-weight:600;margin-bottom:12px;color:#1a1a1a;';
+    title.textContent = '视频合成失败';
+
+    const status = document.createElement('div');
+    status.style.cssText = `font-size:13px;margin-bottom:8px;padding:8px 12px;border-radius:6px;${complete ? 'background:#e6f7ea;color:#1a7f37;' : 'background:#fff4e5;color:#9a6700;'}`;
+    status.textContent = complete ? '✅ 视频已完整加载' : '⚠️ 视频未完整加载';
+
+    const error = document.createElement('div');
+    error.style.cssText = 'font-size:13px;color:#666;margin-bottom:16px;line-height:1.5;word-break:break-all;';
+    error.textContent = '错误信息：' + (errorMsg || '未知错误');
+
+    const btnRow = document.createElement('div');
+    btnRow.style.cssText = 'display:flex;gap:8px;flex-wrap:wrap;';
+
+    const btnSeparate = document.createElement('button');
+    btnSeparate.style.cssText = 'flex:1;min-width:100px;padding:8px 12px;border:1px solid #d0d7de;border-radius:6px;background:#f6f8fa;color:#1a1a1a;font-size:13px;cursor:pointer;';
+    btnSeparate.textContent = '分开下载';
+    btnSeparate.onclick = () => { overlay.remove(); onSeparate(); };
+
+    const btnOnline = document.createElement('button');
+    btnOnline.style.cssText = 'flex:1;min-width:100px;padding:8px 12px;border:1px solid #0969da;border-radius:6px;background:#0969da;color:#fff;font-size:13px;cursor:pointer;';
+    btnOnline.textContent = '在线完整下载';
+    btnOnline.onclick = () => { overlay.remove(); openOnlineTool(); };
+
+    const btnCancel = document.createElement('button');
+    btnCancel.style.cssText = 'flex:1;min-width:80px;padding:8px 12px;border:1px solid #d0d7de;border-radius:6px;background:#fff;color:#666;font-size:13px;cursor:pointer;';
+    btnCancel.textContent = '取消';
+    btnCancel.onclick = () => { overlay.remove(); };
+
+    btnRow.appendChild(btnSeparate);
+    btnRow.appendChild(btnOnline);
+    btnRow.appendChild(btnCancel);
+
+    dialog.appendChild(title);
+    dialog.appendChild(status);
+    dialog.appendChild(error);
+    dialog.appendChild(btnRow);
+    overlay.appendChild(dialog);
+    document.body.appendChild(overlay);
   }
 
   // ========== 核心修复：mp4box无损合成（修复时序：数据喂完后才start） ==========
@@ -740,29 +796,26 @@
         a.remove();
         setTimeout(() => URL.revokeObjectURL(a.href), 1000);
       } catch (e) {
-        // 合成失败：显示完整状态并询问是否分开下载
+        // 合成失败：自定义弹窗，提供分开下载/在线完整下载/取消三个选项
         const complete = isBufferedComplete();
-        const failMsg = `${complete ? '✅ 视频已完整加载' : '⚠️ 视频未完整加载'}
-视频合成失败：${e.message || '未知错误'}
-是否分开下载视频和音频文件？`;
-        if (!confirm(failMsg)) return;
-
-        [videoItems[0], audioItems[0]].forEach((item, idx) => {
-          setTimeout(() => {
-            const kind = itemKind(item);
-            const mime = (item.mime || '').split(';')[0] || (kind === 'audio' ? 'audio/mp4' : 'video/mp4');
-            const ext = mime.split('/')[1] || 'mp4';
-            const type = kind === 'audio' ? '音频' : '视频';
-            const blob = new Blob(item.buffers, { type: mime });
-            const a = document.createElement('a');
-            a.download = `${title}_${type}.${ext}`;
-            a.href = URL.createObjectURL(blob);
-            a.style.display = 'none';
-            document.body.appendChild(a);
-            a.click();
-            a.remove();
-            setTimeout(() => URL.revokeObjectURL(a.href), 1000);
-          }, idx * 300);
+        showMergeFailDialog(complete, e.message, () => {
+          [videoItems[0], audioItems[0]].forEach((item, idx) => {
+            setTimeout(() => {
+              const kind = itemKind(item);
+              const mime = (item.mime || '').split(';')[0] || (kind === 'audio' ? 'audio/mp4' : 'video/mp4');
+              const ext = mime.split('/')[1] || 'mp4';
+              const type = kind === 'audio' ? '音频' : '视频';
+              const blob = new Blob(item.buffers, { type: mime });
+              const a = document.createElement('a');
+              a.download = `${title}_${type}.${ext}`;
+              a.href = URL.createObjectURL(blob);
+              a.style.display = 'none';
+              document.body.appendChild(a);
+              a.click();
+              a.remove();
+              setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+            }, idx * 300);
+          });
         });
       }
     } finally {
