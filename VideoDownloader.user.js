@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         VideoDownloader
 // @namespace    https://doubao.com
-// @version      1.0.4
+// @version      1.0.5
 // @author       Doubao
 // @description  MSE流媒体视频捕获与无损合成下载工具
 // @include      *
@@ -689,15 +689,20 @@
       // 分类音视频：优先mime，mime缺失时用init内容判断的kind兜底
       let videoItems = sourceBufferList.filter(i => itemKind(i) === 'video');
       let audioItems = sourceBufferList.filter(i => itemKind(i) === 'audio');
-      // 最终兜底：若仍分不出来且有≥2个未知条目，按数据总量区分（通常视频远大于音频）
-      if ((videoItems.length === 0 || audioItems.length === 0)) {
+      // 最终兜底：视频或音频缺失时，用未分类条目按数据总量补全（视频通常远大于音频）。
+      // 不要求unknown>=2：常见场景是一个轨识别出来了、另一个轨kind缺失（不完整捕获时
+      // mime没记录+init segment错过），此时只有1个unknown，也必须补全否则会走单轨道分开下载。
+      if (videoItems.length === 0 || audioItems.length === 0) {
         const unknown = sourceBufferList.filter(i => !itemKind(i));
-        if (unknown.length >= 2) {
+        if (unknown.length > 0) {
           const sized = unknown
             .map(i => ({ i, total: i.buffers.reduce((s, b) => s + b.byteLength, 0) }))
             .sort((a, b) => b.total - a.total);
           if (videoItems.length === 0) videoItems = [sized[0].i];
-          if (audioItems.length === 0 && sized[1]) audioItems = [sized[1].i];
+          if (audioItems.length === 0) {
+            // 优先取第二大的unknown（最大的已分配给视频），只有1个时取它本身
+            audioItems = [sized[1] ? sized[1].i : sized[0].i];
+          }
         }
       }
 
