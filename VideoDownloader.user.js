@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         VideoDownloader
 // @namespace    https://doubao.com
-// @version      1.0.7
+// @version      1.0.8
 // @author       mling1
 // @description  MSE流媒体视频捕获与无损合成下载工具
 // @include      *
@@ -320,6 +320,29 @@
     return res.buffer;
   }
 
+  // 截断不完整的最后一个box：视频结束时最后一个moof可能被截断，
+  // 导致mp4box解析错误。从末尾向前找最后一个完整的box，截断到那里。
+  function truncateIncompleteBox(buf) {
+    if (buf.byteLength < 8) return buf;
+    const dv = new DataView(buf);
+    let offset = 0;
+    let lastComplete = 0;
+    while (offset + 8 <= buf.byteLength) {
+      const size = dv.getUint32(offset);
+      if (size < 8 || offset + size > buf.byteLength) {
+        // 这个box不完整，截断到上一个完整box
+        break;
+      }
+      lastComplete = offset + size;
+      offset += size;
+    }
+    if (lastComplete > 0 && lastComplete < buf.byteLength) {
+      console.log(`[VideoDownloader] 截断不完整末尾box: ${buf.byteLength} -> ${lastComplete} 字节`);
+      return buf.slice(0, lastComplete);
+    }
+    return buf;
+  }
+
   function openOnlineTool() {
     // 有m3u8地址时带参数打开，没有时直接打开工具主页
     const url = m3u8Url ? `${ONLINE_TOOL}?url=${encodeURIComponent(m3u8Url)}` : ONLINE_TOOL;
@@ -395,6 +418,7 @@
         let vDataFed = false, aDataFed = false;
         let vStarted = false, aStarted = false;
         let finished = false;
+        let vParseError = null, aParseError = null;
 
         // 视频onReady：只设置提取选项，不立即start（数据还没喂完）
         vFile.onReady = info => {
@@ -410,7 +434,12 @@
         vFile.onSamples = (id, user, samples) => {
           vSamples = vSamples.concat(samples);
         };
-        vFile.onError = e => { if (!finished) reject(new Error('视频解析错误: ' + e)); };
+        vFile.onError = e => {
+          // 不直接reject：最后一个分片可能被截断（视频结束时moof不完整），
+          // 此时已解析的样本仍然可用，标记错误后继续等待完成。
+          console.warn('[VideoDownloader] mp4box解析警告（可能是末尾不完整分片）:', e);
+          vParseError = e;
+        };
 
         // 音频onReady：只设置提取选项，不立即start
         aFile.onReady = info => {
@@ -426,7 +455,10 @@
         aFile.onSamples = (id, user, samples) => {
           aSamples = aSamples.concat(samples);
         };
-        aFile.onError = e => { if (!finished) reject(new Error('音频解析错误: ' + e)); };
+        aFile.onError = e => {
+          console.warn('[VideoDownloader] mp4box解析警告（可能是末尾不完整分片）:', e);
+          aParseError = e;
+        };
 
         // 关键：两个都ready且数据都喂完后，才调用start
         function tryStart() {
@@ -460,11 +492,13 @@
           finished = true;
 
           if (vSamples.length === 0) {
-            reject(new Error('视频样本提取失败（0个样本）'));
+            const errInfo = vParseError ? `（解析警告: ${vParseError}）` : '';
+            reject(new Error(`视频样本提取失败（0个样本）${errInfo}`));
             return;
           }
           if (aSamples.length === 0) {
-            reject(new Error('音频样本提取失败（0个样本）'));
+            const errInfo = aParseError ? `（解析警告: ${aParseError}）` : '';
+            reject(new Error(`音频样本提取失败（0个样本）${errInfo}`));
             return;
           }
 
@@ -592,8 +626,9 @@
 
         // 拼接所有分片后一次性喂入（fMP4分片拼接后是完整文件）
         // 注意：mp4box的appendBuffer必须接收ArrayBuffer，不能接收Uint8Array，否则会报DataView错误
-        const fullVideo = concatBufs(videoBufs);
-        const fullAudio = concatBufs(audioBufs);
+        // 截断不完整的最后一个box（视频结束时moof可能被截断，导致解析错误）
+        const fullVideo = truncateIncompleteBox(concatBufs(videoBufs));
+        const fullAudio = truncateIncompleteBox(concatBufs(audioBufs));
 
         // 检测是否包含初始化片段（ftyp box），缺少则无法解析
         function getFirstBoxType(buf) {
@@ -742,6 +777,8 @@
 
     try {
       const title = getTitle();
+      // 不完整下载时文件名加"片段"后缀
+      const nameSuffix = isBufferedComplete() ? '' : '_片段';
       // 分类音视频：优先mime，mime缺失时用init内容判断的kind兜底
       let videoItems = sourceBufferList.filter(i => itemKind(i) === 'video');
       let audioItems = sourceBufferList.filter(i => itemKind(i) === 'audio');
@@ -771,7 +808,7 @@
             const ext = mime.split('/')[1] || 'mp4';
             const blob = new Blob(item.buffers, { type: mime });
             const a = document.createElement('a');
-            a.download = `${title}.${ext}`;
+            a.download = `${title}${nameSuffix}.${ext}`;
             a.href = URL.createObjectURL(blob);
             a.style.display = 'none';
             document.body.appendChild(a);
@@ -788,7 +825,7 @@
         btnDownload.textContent = '合成中...';
         const mergedBlob = await mergeMP4(videoItems[0].buffers, audioItems[0].buffers);
         const a = document.createElement('a');
-        a.download = `${title}.mp4`;
+        a.download = `${title}${nameSuffix}.mp4`;
         a.href = URL.createObjectURL(mergedBlob);
         a.style.display = 'none';
         document.body.appendChild(a);
@@ -807,7 +844,7 @@
               const type = kind === 'audio' ? '音频' : '视频';
               const blob = new Blob(item.buffers, { type: mime });
               const a = document.createElement('a');
-              a.download = `${title}_${type}.${ext}`;
+              a.download = `${title}${nameSuffix}_${type}.${ext}`;
               a.href = URL.createObjectURL(blob);
               a.style.display = 'none';
               document.body.appendChild(a);
