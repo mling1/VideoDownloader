@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         VideoDownloader
 // @namespace    https://github.com/mling1/VideoDownloader
-// @version      1.8.3
+// @version      1.8.4
 // @author       mling1
 // @description  MSE流媒体视频捕获与无损合成下载工具
 // @include      *

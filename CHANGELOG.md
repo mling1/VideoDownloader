@@ -1,5 +1,13 @@
 # 更新日志
 
+## v1.8.4 (2026-09-09)
+
+### 修复
+
+- 修复已知问题（VideoDownloader.user.js、README.md、CHANGELOG.md）
+
+---
+
 ## v1.8.3 (2026-09-09)
 
 ### 修复
