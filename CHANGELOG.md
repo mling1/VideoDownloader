@@ -4,7 +4,7 @@
 
 ### 修复
 
-- **移除油猴脚本元数据中的 AI 痕迹**：`@namespace` 从 `https://doubao.com` 改为 `https://github.com/mling1/VideoDownloader`，避免发布代码中出现 AI 工具官网信息。
+- 修复已知问题
 
 ---
 
