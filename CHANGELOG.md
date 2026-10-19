@@ -6,6 +6,10 @@
 
 - 修复已知问题（VideoDownloader.user.js、README.md、CHANGELOG.md）
 
+### 其他
+
+- 开源协议由 MIT 更换为 CC BY-NC 4.0（署名-非商业性使用），禁止商业用途
+
 ---
 
 ## v1.8.3 (2026-09-09)

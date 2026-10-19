@@ -96,7 +96,7 @@ A: 所有使用 MSE 播放流媒体的网站。不支持纯 m3u8 直链、WebRTC
 
 ## 许可证
 
-[MIT License](./LICENSE)
+[CC BY-NC 4.0（署名-非商业性使用）](./LICENSE)
 
 ## 免责声明
 
